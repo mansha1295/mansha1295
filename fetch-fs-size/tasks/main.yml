@@ -1,0 +1,71 @@
+---
+# tasks/main.yml
+
+- name: Ensure output directory exists on control node
+  delegate_to: localhost
+  run_once: true
+  ansible.builtin.file:
+    path: "/tmp/output"
+    state: directory
+    mode: '0755'
+
+- name: Gather filesystem usage for /, /var, /opt
+  ansible.builtin.shell: |
+    df -h --output=target,size,used,avail | awk 'NR>1 && ($1 == "/" || $1 == "/var" || $1 == "/opt") {print $1","$2","$3","$4}'
+  register: fs_output
+  changed_when: false
+
+# 🔹 Build per-host CSV lines (corrected regex)
+- name: Build per-host CSV lines (with hostname prefix and final newline)
+  ansible.builtin.set_fact:
+    fs_info_lines: >-
+      {{
+        (fs_output.stdout_lines | default([]))
+        | map('regex_replace', '^(.*)$', inventory_hostname ~ ',\1')
+        | list
+      }}
+
+- name: Write per-host CSV data to temp file on control node (guarantee trailing newline)
+  delegate_to: localhost
+  ansible.builtin.copy:
+    content: "{{ (fs_info_lines | join('\n')) ~ '\n' }}"
+    dest: "/tmp/{{ inventory_hostname }}_fs.csv"
+    mode: '0644'
+  when: fs_info_lines | length > 0
+
+- name: Combine all per-host CSV files into one
+  delegate_to: localhost
+  run_once: true
+  ansible.builtin.shell: |
+    echo "hostname,mount,size,used,avail" > /tmp/output/fs_sizes.csv
+    cat /tmp/*_fs.csv >> /tmp/output/fs_sizes.csv
+  args:
+    executable: /bin/bash
+
+- name: Cleanup temporary CSV fragments
+  delegate_to: localhost
+  run_once: true
+  ansible.builtin.file:
+    path: "/tmp"
+    state: directory
+    mode: '1777'
+
+# 🔹 NEW TASK: Send CSV report via email
+- name: Send CSV report via email
+  delegate_to: localhost
+  run_once: true
+  ansible.builtin.mail:
+    host: localhost
+    port: 25
+    subject: "RHEL Filesystem Report - {{ ansible_date_time.date }}"
+    body: |
+      Hi Team,
+
+      Please find attached the filesystem size report for RHEL servers.
+
+      Regards,
+      Ansible Automation
+    from: "ansible@yourdomain.com"
+    to: "linux-admins@yourdomain.com"
+    attach:
+      - "/tmp/output/fs_sizes.csv"
